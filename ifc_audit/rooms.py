@@ -5,10 +5,7 @@ from __future__ import annotations
 from shapely.geometry import Point
 
 from .model import AuditModel, RoomArea, Issue, DOOR, WINDOW
-from .checks import BARRIER_BUFFER
-
-AREA_DEV_WARN = 0.02  # 声明面积与几何面积偏差超过 2% 时提示
-ASSIGN_TOL = BARRIER_BUFFER + 0.05  # 门窗归入房间的距离容差
+from .thresholds import DEFAULT_THRESHOLDS, Thresholds
 
 
 def _distance_to_room(point_xy, room_elem) -> float:
@@ -18,10 +15,13 @@ def _distance_to_room(point_xy, room_elem) -> float:
     return float(room_elem.footprint.distance(Point(point_xy)))
 
 
-def build_room_areas(model: AuditModel) -> AuditModel:
+def build_room_areas(model: AuditModel,
+                     th: Thresholds = DEFAULT_THRESHOLDS) -> AuditModel:
+    """按本次阈值统计房间净面积、门窗归属与面积偏差。"""
     declared = getattr(model, "_declared_areas", {})
     doors = model.by_type(DOOR)
     windows = model.by_type(WINDOW)
+    assign_tol = th.assign_distance
 
     for room in model.by_type("IfcSpace"):
         gid = room.global_id
@@ -38,9 +38,9 @@ def build_room_areas(model: AuditModel) -> AuditModel:
 
         # 门位于两个房间边界上：形心落在轮廓内或距边界足够近即归入
         room_doors = [d.global_id for d in doors
-                      if _distance_to_room(d.centroid[:2], room) <= ASSIGN_TOL]
+                      if _distance_to_room(d.centroid[:2], room) <= assign_tol]
         room_windows = [w.global_id for w in windows
-                        if _distance_to_room(w.centroid[:2], room) <= ASSIGN_TOL]
+                        if _distance_to_room(w.centroid[:2], room) <= assign_tol]
 
         perimeter = float(fp.length) if fp is not None else 0.0
         # 三态：无几何的房间无法检查围护，标记为 unchecked，不得给出闭合结论
@@ -91,7 +91,7 @@ def build_room_areas(model: AuditModel) -> AuditModel:
                 measure=r.net_area,
             ))
             seq += 1
-        elif r.deviation > AREA_DEV_WARN:
+        elif r.deviation > th.area_dev_warn:
             model.issues.append(Issue(
                 issue_id=f"AREA-{seq:03d}",
                 severity="warning",
@@ -99,7 +99,8 @@ def build_room_areas(model: AuditModel) -> AuditModel:
                 title=f"房间“{r.name}”声明净面积与几何值偏差 {r.deviation*100:.1f}%",
                 detail=(
                     f"声明净面积 {r.declared_area:.2f} m²，"
-                    f"几何计算 {r.computed_area:.2f} m²。"
+                    f"几何计算 {r.computed_area:.2f} m²，"
+                    f"偏差超过警告线 {th.area_dev_warn*100:g}%。"
                 ),
                 global_ids=[r.global_id],
                 location=r.centroid,

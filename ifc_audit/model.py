@@ -133,6 +133,10 @@ class AuditModel:
     # 重复构件分组
     duplicate_groups: list[list[str]] = field(default_factory=list)
 
+    # 本次核查使用的判定阈值及来源（报告中注明）
+    thresholds: object = None
+    threshold_provenance: object = None
+
     def by_type(self, ifc_type: str) -> list[Element]:
         return [e for e in self.elements.values() if e.ifc_type == ifc_type]
 

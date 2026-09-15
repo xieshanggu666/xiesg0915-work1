@@ -27,8 +27,148 @@ from .pipeline import audit_ifc
 from . import report
 from .report import KIND_CN, SEV_CN
 from .viewer import _product_meshes, TYPE_COLOR, HIGHLIGHT, issue_xyz
+from .thresholds import (
+    PROFILES, PROFILE_CN, META, GROUP_CN, resolve,
+    ThresholdConfigError, write_config_template,
+)
 
 SEV_TAG = {"error": "err", "warning": "warn", "info": "info"}
+
+
+class ThresholdDialog(tk.Toplevel):
+    """阈值设置：预设 / 配置文件 / 逐项编辑（单位 mm 与 %）。"""
+
+    def __init__(self, master, state: dict):
+        super().__init__(master)
+        self.title("判定阈值设置")
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+        self.result = None
+        self._state = state
+        self._vars = {}
+        self._build()
+
+    def _build(self):
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill="both", expand=True)
+
+        top = ttk.Frame(frm)
+        top.pack(fill="x", pady=(0, 8))
+        ttk.Label(top, text="阈值预设：").pack(side="left")
+        self.var_profile = tk.StringVar(value=self._state.get("profile", "default"))
+        ttk.Combobox(top, textvariable=self.var_profile, state="readonly",
+                     values=PROFILES, width=10).pack(side="left")
+        ttk.Button(top, text="载入配置文件…",
+                   command=self._load_config).pack(side="left", padx=(12, 0))
+        ttk.Button(top, text="导出当前配置…",
+                   command=self._save_config).pack(side="left", padx=4)
+        self.var_cfg = tk.StringVar(
+            value=self._state.get("config_path") or "未使用配置文件")
+        ttk.Label(frm, textvariable=self.var_cfg, foreground="#555").pack(
+            anchor="w", pady=(0, 6))
+
+        # 逐项阈值，按分组排列
+        grid = ttk.Frame(frm)
+        grid.pack(fill="both")
+        current_values = self._state.get("values", {})
+        t0, _ = resolve(self.var_profile.get())
+        row = 0
+        last_group = None
+        for key, spec in META.items():
+            if spec.group != last_group:
+                ttk.Label(grid, text=GROUP_CN[spec.group],
+                          font=("", 9, "bold")).grid(
+                    row=row, column=0, columnspan=3, sticky="w",
+                    pady=(6, 2))
+                row += 1
+                last_group = spec.group
+            ttk.Label(grid, text=spec.label).grid(row=row, column=0,
+                                                  sticky="w", padx=(12, 8))
+            default_v = spec.to_user(getattr(t0, spec.attr))
+            v = tk.StringVar(value=str(current_values.get(key, default_v)))
+            self._vars[key] = v
+            ttk.Entry(grid, textvariable=v, width=9).grid(row=row, column=1,
+                                                          sticky="e")
+            unit = {"mm": "mm", "%": "%", "ratio": "(0~1)"}[spec.unit]
+            ttk.Label(grid, text=unit, foreground="#555").grid(
+                row=row, column=2, sticky="w", padx=(4, 0))
+            row += 1
+
+        ttk.Label(frm, text="提示：长度单位毫米，面积偏差单位百分比；"
+                            "改动在下次核查时生效。",
+                  foreground="#555", wraplength=420).pack(anchor="w",
+                                                          pady=(8, 0))
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(10, 0))
+        ttk.Button(btns, text="恢复预设值",
+                   command=self._reset_to_profile).pack(side="left")
+        ttk.Button(btns, text="取消", command=self.destroy).pack(side="right")
+        ttk.Button(btns, text="确定", command=self._on_ok).pack(side="right",
+                                                                padx=6)
+
+    def _reset_to_profile(self):
+        t0, _ = resolve(self.var_profile.get())
+        for key, spec in META.items():
+            self._vars[key].set(
+                str(spec.to_user(getattr(t0, spec.attr))))
+
+    def _load_config(self):
+        path = filedialog.askopenfilename(
+            title="选择阈值配置文件",
+            filetypes=[("JSON 配置", "*.json"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            t, prov = resolve(self.var_profile.get(), path)
+        except ThresholdConfigError as exc:
+            messagebox.showerror("配置错误", str(exc), parent=self)
+            return
+        self.var_cfg.set(path)
+        for key, spec in META.items():
+            self._vars[key].set(
+                str(spec.to_user(getattr(t, spec.attr))))
+
+    def _save_config(self):
+        path = filedialog.asksaveasfilename(
+            title="导出阈值配置", defaultextension=".json",
+            filetypes=[("JSON 配置", "*.json")])
+        if not path:
+            return
+        try:
+            write_config_template(path, self.var_profile.get())
+        except OSError as exc:
+            messagebox.showerror("导出失败", str(exc), parent=self)
+            return
+        messagebox.showinfo("已导出", f"配置模板已保存：\n{path}", parent=self)
+
+    def _on_ok(self):
+        values = {}
+        for key, var in self._vars.items():
+            raw = var.get().strip()
+            try:
+                v = float(raw)
+            except ValueError:
+                messagebox.showerror(
+                    "格式错误", f"{META[key].label} 不是数字：{raw}",
+                    parent=self)
+                return
+            spec = META[key]
+            if not (spec.minv <= v <= spec.maxv):
+                messagebox.showerror(
+                    "超出范围",
+                    f"{spec.label} 需在 [{spec.minv:g}, {spec.maxv:g}] 之间",
+                    parent=self)
+                return
+            values[key] = v
+        self.result = {
+            "profile": self.var_profile.get(),
+            "config_path": None if self.var_cfg.get() == "未使用配置文件"
+            else self.var_cfg.get(),
+            "values": values,
+        }
+        self.destroy()
 
 
 class App(tk.Tk):
@@ -38,6 +178,9 @@ class App(tk.Tk):
         self.geometry("1280x820")
         self.model = None
         self.mesh_data = {}
+        # 阈值设置状态：预设 + 可选配置文件 + GUI 逐项覆盖（用户单位）
+        self.threshold_state = {"profile": "default",
+                                "config_path": None, "values": {}}
         self._build_ui()
 
     # ------------------------------------------------------------- UI ----
@@ -51,6 +194,8 @@ class App(tk.Tk):
         ttk.Button(top, text="浏览…", command=self.pick_file).pack(side="left")
         self.btn_run = ttk.Button(top, text="开始核查", command=self.run_audit)
         self.btn_run.pack(side="left", padx=6)
+        ttk.Button(top, text="阈值设置…",
+                   command=self.edit_thresholds).pack(side="left")
         ttk.Button(top, text="导出到目录…", command=self.export_all).pack(side="left")
         ttk.Button(top, text="在 PyVista 中打开",
                    command=self.open_pyvista).pack(side="left", padx=6)
@@ -133,17 +278,44 @@ class App(tk.Tk):
         if path:
             self.var_file.set(path)
 
+    def edit_thresholds(self):
+        dlg = ThresholdDialog(self, self.threshold_state)
+        self.wait_window(dlg)
+        if dlg.result is not None:
+            self.threshold_state = dlg.result
+            prov_text = self._threshold_summary()
+            self.var_status.set(f"阈值已更新：{prov_text}。开始核查后生效。")
+
+    def _threshold_summary(self) -> str:
+        try:
+            _, prov = resolve(
+                self.threshold_state["profile"],
+                self.threshold_state.get("config_path"),
+                self.threshold_state.get("values") or None)
+            return prov.describe()
+        except ThresholdConfigError as exc:
+            return f"阈值配置有误（{exc}）"
+
     def run_audit(self):
         path = self.var_file.get().strip()
         if not path or not os.path.exists(path):
             messagebox.showerror("错误", "请选择有效的 IFC 文件。")
+            return
+        try:
+            thresholds, provenance = resolve(
+                self.threshold_state["profile"],
+                self.threshold_state.get("config_path"),
+                self.threshold_state.get("values") or None)
+        except ThresholdConfigError as exc:
+            messagebox.showerror("阈值配置错误", str(exc))
             return
         self.btn_run.configure(state="disabled")
         self.var_status.set("正在核查，请稍候…")
 
         def work():
             try:
-                m = audit_ifc(path)
+                m = audit_ifc(path, thresholds=thresholds,
+                              provenance=provenance)
                 self.after(0, lambda: self.on_done(m))
             except Exception as run_exc:
                 self.after(0, lambda e=run_exc: self.on_fail(e))
@@ -162,7 +334,8 @@ class App(tk.Tk):
         self.var_status.set(
             f"完成：墙 {s['walls']} / 门 {s['doors']} / 窗 {s['windows']} / "
             f"房间 {s['rooms']}；问题 {s['issues']} 条（错误 {s['errors']}，"
-            f"警告 {s['warnings']}）；净面积合计 {s['total_net_area']} m²")
+            f"警告 {s['warnings']}）；净面积合计 {s['total_net_area']} m²。"
+            f"阈值方案：{model.threshold_provenance.describe()}")
 
         self.tree.delete(*self.tree.get_children())
         for n, i in enumerate(model.issues, start=1):

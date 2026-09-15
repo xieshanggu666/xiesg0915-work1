@@ -12,6 +12,10 @@
    声明值，缺失时由房间平面几何计算；并校验声明值与几何值偏差（默认 >2% 警告），
    统计每个房间的门、窗数量与围护闭合状态。
 
+四类判定阈值（自由端 / 墙段缺口、房间围护缺口、重复构件、面积偏差）均**可配置**：
+内置标准/严格/宽松三套预设，也可用 JSON 配置文件或命令行 `--set` 单项调整，
+每次报告（Excel「判定阈值」表、JSON、平面图标注、控制台）都会注明本次使用的阈值方案。
+
 结果支持：
 
 - **点击问题定位构件**：GUI 中点击问题列表，三维视图高亮对应构件并缩放到该位置；
@@ -37,10 +41,20 @@ pip install -r requirements.txt
 # 核查并导出全部报告到 output/
 python -m ifc_audit.cli audit path/to/model.ifc -o output/
 
+# 切换严格预设（竣工审查）/ 宽松预设（方案阶段粗模）
+python -m ifc_audit.cli audit model.ifc --profile strict
+
+# 用配置文件调阈值；命令行再单项覆盖（长度 mm，面积偏差 %）
+python -m ifc_audit.cli audit model.ifc --config thresholds.json \
+    --set gap_min_len_mm=50 --set area_dev_warn_pct=1
+
+# 生成带中文说明的配置模板（可基于 strict / loose 预设生成）
+python -m ifc_audit.cli init-config thresholds.json --profile default
+
 # CI 场景：存在错误级问题时退出码为 1
 python -m ifc_audit.cli audit model.ifc --fail-on-error -q
 
-# 图形界面（浏览文件、点击定位、导出）
+# 图形界面（浏览文件、阈值设置、点击定位、导出）
 python -m ifc_audit.cli gui
 ```
 
@@ -94,6 +108,89 @@ viewer.locate(issue.global_ids)   # 高亮并把相机对准构件
 viewer.run()
 ```
 
+## 判定阈值配置
+
+四类判定的全部阈值集中在 `ifc_audit/thresholds.py`，调整方式有三种，
+**优先级从低到高**：内置预设 → 配置文件 → 命令行单项覆盖。
+
+### 1. 内置预设
+
+| 预设 | 适用场景 | 自由端容差 | 缺口聚类 | 围护缺口下限 | 重复形心距 | 体积比 / IoU | 面积偏差 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `default` 标准 | 常规施工图模型 | 50mm | 300mm | 100mm | 80mm | 0.85 / 0.70 | 2% |
+| `strict` 严格 | 高精度模型 / 竣工审查 | 30mm | 200mm | 50mm | 50mm | 0.90 / 0.80 | 1% |
+| `loose` 宽松 | 方案阶段 / 粗模 | 100mm | 500mm | 200mm | 150mm | 0.80 / 0.60 | 5% |
+
+### 2. JSON 配置文件
+
+```bash
+python -m ifc_audit.cli init-config thresholds.json   # 生成带中文说明的模板
+python -m ifc_audit.cli audit model.ifc --config thresholds.json
+```
+
+文件中 `profile` 指定基准预设，其余键逐项覆盖；以 `_` 开头的键为注释，
+会被忽略。用户面单位：长度 **毫米（mm）**，面积偏差 **百分比（%）**，
+体积比 / IoU 为 0~1 小数：
+
+```json
+{
+  "profile": "default",
+  "gap_min_len_mm": 50,
+  "area_dev_warn_pct": 1,
+  "dup_iou": 0.80
+}
+```
+
+### 3. 命令行单项覆盖
+
+`--set key=value` 可重复，优先级最高；非法键名或越界值会报错并以退出码 2 终止：
+
+```bash
+python -m ifc_audit.cli audit model.ifc \
+    --profile strict --set dup_iou=0.95 --set free_end_tol_mm=20
+```
+
+### 可配置键一览
+
+| 配置键 | 含义 | 单位 | 分组 |
+| --- | --- | --- | --- |
+| `free_end_tol_mm` | 墙端头伸入其它墙体的判定容差 | mm | 自由端 |
+| `endpoint_merge_tol_mm` | 邻近自由端聚类为「墙段缺口」的容差 | mm | 墙段缺口 |
+| `gap_min_len_mm` | 房间围护缺口最小上报长度 | mm | 围护缺口 |
+| `barrier_buffer_mm` | 围护覆盖外扩容差（毫米级建模误差吸收） | mm | 围护缺口 |
+| `dup_centroid_tol_mm` | 重复构件形心距离 | mm | 重复构件 |
+| `dup_vol_ratio` | 重复构件体积相似度（小/大） | 0~1 | 重复构件 |
+| `dup_iou` | 重复构件平面轮廓 IoU | 0~1 | 重复构件 |
+| `area_dev_warn_pct` | 声明面积与几何面积偏差警告线 | % | 面积偏差 |
+
+### 报告中注明本次阈值
+
+- Excel 汇总表新增「判定阈值方案」行，并新增 **「判定阈值」工作表**
+  （分组 / 判定项 / 本次取值 / 配置键）；
+- `*_结果.json` 的 `thresholds` 段记录完整取值与来源（预设名、配置文件路径、覆盖项）；
+- 平面标注图页脚、控制台汇总均打印阈值方案说明；
+- 每条问题详情使用**本次实际阈值**描述（如「上报下限 50mm」「偏差超过警告线 1%」）。
+
+作为 Python 库调用时，可直接传阈值对象（内部单位为米/比例）：
+
+```python
+from ifc_audit.pipeline import audit_ifc_with_config, audit_ifc
+from ifc_audit.thresholds import resolve
+
+# 方式一：与 CLI 一致的解析（预设 + 配置文件 + 用户单位覆盖）
+model = audit_ifc_with_config("model.ifc",
+                              profile="strict",
+                              config_path="thresholds.json",
+                              overrides={"gap_min_len_mm": 50})
+
+# 方式二：自行解析后传入
+th, prov = resolve("default", overrides={"free_end_tol_mm": 20})
+model = audit_ifc("model.ifc", thresholds=th, provenance=prov)
+```
+
+GUI 中点击工具栏「阈值设置…」可切换预设、载入配置文件或逐项编辑，
+下次「开始核查」生效。
+
 ## 核查方法说明
 
 - **几何提取**：优先解析参数化 `IfcExtrudedAreaSolid` 的二维轮廓
@@ -109,7 +206,9 @@ viewer.run()
 - **重复构件**：同类构件两两比较，形心距 < 80mm、体积比 ≥ 0.85、
   封闭轮廓 IoU ≥ 0.70 即判重，并查集聚类成组。
 
-容差常量集中在 `ifc_audit/checks.py` 顶部，可按项目精度要求调整。
+判定阈值集中在 `ifc_audit/thresholds.py`，支持内置预设（标准/严格/宽松）、
+JSON 配置文件与命令行 `--set` 三种方式调整，详见上文「判定阈值配置」。
+每次报告都会注明本次使用的阈值方案。
 
 ## 生成自带已知问题的样例模型
 
@@ -129,6 +228,7 @@ ifc_audit/
   geometry.py    网格切片、轮廓提取、中轴线/厚度
   analytic.py    参数化 IfcExtrudedAreaSolid 轮廓解析
   extract.py     IFC 提取墙/门/窗/房间
+  thresholds.py  判定阈值：预设 / 配置文件 / 命令行覆盖
   checks.py      重复构件、自由端、墙段缺口、房间围护
   rooms.py       房间净面积清单
   report.py      Excel / CSV / 平面标注图

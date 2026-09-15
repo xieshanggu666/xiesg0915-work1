@@ -1,4 +1,8 @@
-"""核查规则：重复构件与未闭合墙检测。"""
+"""核查规则：重复构件与未闭合墙检测。
+
+判定阈值集中在 :mod:`ifc_audit.thresholds`，由流程层传入；
+本模块顶部的常量仅为向后兼容保留的默认值。
+"""
 
 from __future__ import annotations
 
@@ -10,16 +14,17 @@ from shapely.geometry import Point
 from shapely.ops import unary_union
 
 from .model import AuditModel, Issue, WALL, DOOR, WINDOW, SPACE
+from .thresholds import DEFAULT_THRESHOLDS, Thresholds
 
-# 判定阈值（单位：米）
-FREE_END_TOL = 0.05        # 墙端头伸入其它墙体的判定容差
-ENDPOINT_MERGE_TOL = 0.30  # 自由端聚类为“墙间缺口”的容差
-GAP_MIN_LEN = 0.10         # 房间围护缺口最小长度
-BARRIER_BUFFER = 0.005     # 围护构件覆盖边界的外扩容差（仅吸收建模误差，毫米级）
-DUP_CENTROID_TOL = 0.08    # 重复构件形心距离
-DUP_VOL_RATIO = 0.85       # 重复构件体积相似度
-DUP_IOU = 0.70             # 重复构件平面轮廓 IoU
-SAMPLE_STEP = 0.05         # 房间边界采样步长
+# 默认判定阈值（单位：米）——阈值现可通过配置文件 / 命令行调整，
+# 这些常量仅保留给直接 import 的旧代码，等价于 default 预设。
+FREE_END_TOL = DEFAULT_THRESHOLDS.free_end_tol        # 墙端头伸入其它墙体的判定容差
+ENDPOINT_MERGE_TOL = DEFAULT_THRESHOLDS.endpoint_merge_tol  # 自由端聚类为“墙间缺口”的容差
+GAP_MIN_LEN = DEFAULT_THRESHOLDS.gap_min_len          # 房间围护缺口最小长度
+BARRIER_BUFFER = DEFAULT_THRESHOLDS.barrier_buffer    # 围护构件覆盖边界的外扩容差（毫米级）
+DUP_CENTROID_TOL = DEFAULT_THRESHOLDS.dup_centroid_tol  # 重复构件形心距离
+DUP_VOL_RATIO = DEFAULT_THRESHOLDS.dup_vol_ratio      # 重复构件体积相似度
+DUP_IOU = DEFAULT_THRESHOLDS.dup_iou                  # 重复构件平面轮廓 IoU
 
 
 def _union_footprints(elements, include_doors=True, include_windows=False):
@@ -37,7 +42,8 @@ def _iou(a, b) -> float:
     return inter / union if union > 0 else 0.0
 
 
-def find_duplicates(model: AuditModel) -> None:
+def find_duplicates(model: AuditModel,
+                    th: Thresholds = DEFAULT_THRESHOLDS) -> None:
     """检测重复构件：同类型、形心重合且几何（体积/轮廓）基本相同。"""
     parent = {}
 
@@ -63,16 +69,16 @@ def find_duplicates(model: AuditModel) -> None:
             continue
         for a, b in itertools.combinations(elems, 2):
             dist = float(np.linalg.norm(a.centroid - b.centroid))
-            if dist > DUP_CENTROID_TOL:
+            if dist > th.dup_centroid_tol:
                 continue
             va, vb = a.volume, b.volume
             if va > 1e-6 and vb > 1e-6:
                 ratio = min(va, vb) / max(va, vb)
-                if ratio < DUP_VOL_RATIO:
+                if ratio < th.dup_vol_ratio:
                     continue
             score = _iou(a.hull or a.footprint, b.hull or b.footprint)
             # 体积极小或无轮廓的构件（如纯占位件），只要形心重合也判重
-            if score < DUP_IOU and va * vb > 1e-6:
+            if score < th.dup_iou and va * vb > 1e-6:
                 continue
             union(a.global_id, b.global_id)
             pair_records.append((a, b, dist, score))
@@ -92,8 +98,9 @@ def find_duplicates(model: AuditModel) -> None:
         names = sorted({e.name for e in elems if e.name})
         title = f"重复{tname}构件 ×{len(elems)}"
         detail = (
-            f"{len(elems)} 个{tname}形心距离 < {DUP_CENTROID_TOL*1000:.0f}mm "
-            f"且几何一致（轮廓 IoU ≥ {DUP_IOU}）。"
+            f"{len(elems)} 个{tname}形心距离 < {th.dup_centroid_tol*1000:.0f}mm "
+            f"且几何一致（体积比 ≥ {th.dup_vol_ratio:g}，"
+            f"轮廓 IoU ≥ {th.dup_iou:g}）。"
             f"构件：{', '.join(e.label for e in elems)}"
         )
         if names:
@@ -118,7 +125,8 @@ def _wall_barrier(model: AuditModel, exclude_id: str | None = None):
     return unary_union([e.footprint for e in walls]) if walls else None
 
 
-def find_wall_closures(model: AuditModel) -> None:
+def find_wall_closures(model: AuditModel,
+                       th: Thresholds = DEFAULT_THRESHOLDS) -> None:
     """检测自由墙端与墙间缺口。"""
     walls = [e for e in model.by_type(WALL) if e.axis is not None]
     # 每条墙用“其它墙”的联合做端点测试
@@ -135,7 +143,7 @@ def find_wall_closures(model: AuditModel) -> None:
             o.footprint for o in walls
             if o.global_id != w.global_id and o.footprint is not None
         ])
-        probe = others_fp.buffer(FREE_END_TOL) if others_fp is not None else None
+        probe = others_fp.buffer(th.free_end_tol) if others_fp is not None else None
         for coord in w.axis.coords:
             p = Point(coord[:2])
             if probe is None or not p.intersects(probe):
@@ -150,7 +158,7 @@ def find_wall_closures(model: AuditModel) -> None:
         gid, pt = item
         placed = False
         for cl in clusters:
-            if np.linalg.norm(pt - cl[0][1]) <= ENDPOINT_MERGE_TOL:
+            if np.linalg.norm(pt - cl[0][1]) <= th.endpoint_merge_tol:
                 cl.append(item)
                 placed = True
                 break
@@ -173,7 +181,8 @@ def find_wall_closures(model: AuditModel) -> None:
                 kind="wall_end_gap",
                 title=f"墙段端头未闭合，缺口约 {gap*1000:.0f} mm",
                 detail=(
-                    "两段墙的端头没有搭接，平面上形成开口。"
+                    "两段墙的端头没有搭接，平面上形成开口"
+                    f"（端头聚类容差 {th.endpoint_merge_tol*1000:.0f}mm）。"
                     f"涉及构件：{', '.join(model.elements[g].label for g in ids)}。"
                 ),
                 global_ids=ids,
@@ -190,7 +199,7 @@ def find_wall_closures(model: AuditModel) -> None:
                 title="墙体自由端（端头未与任何墙体连接）",
                 detail=(
                     f"墙体“{w.name or w.global_id[:8]}”的端头在 "
-                    f"{FREE_END_TOL*1000:.0f}mm 范围内没有其它墙体与之相接。"
+                    f"{th.free_end_tol*1000:.0f}mm 范围内没有其它墙体与之相接。"
                 ),
                 global_ids=ids,
                 location=(float(center[0]), float(center[1])),
@@ -199,12 +208,13 @@ def find_wall_closures(model: AuditModel) -> None:
         seq += 1
 
 
-def find_room_enclosure(model: AuditModel) -> None:
+def find_room_enclosure(model: AuditModel,
+                        th: Thresholds = DEFAULT_THRESHOLDS) -> None:
     """逐房间检查围护边界：墙身与门扇覆盖不到的边界段即围护缺口。"""
     barriers = [e.footprint for e in model.by_type(WALL) if e.footprint is not None]
     # 门用凸包（完整门扇）覆盖门洞；窗不参与围护
     barriers += [e.footprint for e in model.by_type(DOOR) if e.footprint is not None]
-    barrier = unary_union(barriers).buffer(BARRIER_BUFFER) if barriers else None
+    barrier = unary_union(barriers).buffer(th.barrier_buffer) if barriers else None
 
     seq = 1
     for room in model.by_type(SPACE):
@@ -239,7 +249,7 @@ def find_room_enclosure(model: AuditModel) -> None:
             gap_lines = [g for g in gaps.geoms if g.geom_type == "LineString"]
 
         # 保留长度超阈值的缺口；房间外轮廓上的缺口最值得报
-        big = [g for g in gap_lines if g.length > GAP_MIN_LEN]
+        big = [g for g in gap_lines if g.length > th.gap_min_len]
         model.room_gaps[room.global_id] = big
 
         for g in big:
@@ -250,7 +260,8 @@ def find_room_enclosure(model: AuditModel) -> None:
                 kind="room_enclosure_gap",
                 title=f"房间“{room.name}”围护缺口 {g.length*1000:.0f} mm",
                 detail=(
-                    f"房间边界有 {g.length:.2f}m 没有墙或门覆盖，"
+                    f"房间边界有 {g.length:.2f}m 没有墙或门覆盖"
+                    f"（上报下限 {th.gap_min_len*1000:.0f}mm），"
                     "该房间未完全闭合（可能漏画墙或墙段未对齐）。"
                 ),
                 global_ids=[room.global_id],
@@ -261,10 +272,11 @@ def find_room_enclosure(model: AuditModel) -> None:
             seq += 1
 
 
-def run_all_checks(model: AuditModel) -> AuditModel:
-    find_duplicates(model)
-    find_wall_closures(model)
-    find_room_enclosure(model)
+def run_all_checks(model: AuditModel,
+                   th: Thresholds = DEFAULT_THRESHOLDS) -> AuditModel:
+    find_duplicates(model, th)
+    find_wall_closures(model, th)
+    find_room_enclosure(model, th)
     # 按楼层、位置排序，报告更稳定
     model.issues.sort(key=lambda i: (i.storey, i.kind, i.issue_id))
     return model

@@ -1,0 +1,207 @@
+"""阈值可配置性测试（不依赖 pytest，可直接运行）。
+
+用法::
+
+    python tests/test_thresholds.py
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from tools.make_sample_ifc import make_sample  # noqa: E402
+from ifc_audit.pipeline import audit_ifc_with_config  # noqa: E402
+from ifc_audit import report  # noqa: E402
+from ifc_audit.thresholds import (  # noqa: E402
+    resolve, for_profile, parse_set_items, write_config_template,
+    ThresholdConfigError, META,
+)
+from ifc_audit.cli import main as cli_main  # noqa: E402
+
+
+def run() -> int:
+    failures = []
+
+    def check(cond, msg):
+        print(("PASS " if cond else "FAIL ") + msg)
+        if not cond:
+            failures.append(msg)
+
+    with tempfile.TemporaryDirectory() as td:
+        ifc_path = os.path.join(td, "sample.ifc")
+        make_sample(ifc_path)
+
+        # ---- 1) 默认预设与样例基线一致 ----
+        model = audit_ifc_with_config(ifc_path)
+        kinds = {}
+        for i in model.issues:
+            kinds[i.kind] = kinds.get(i.kind, 0) + 1
+        check(kinds.get("wall_end_gap") == 1, "默认预设：1 处墙段缺口")
+        check(kinds.get("room_enclosure_gap") == 1, "默认预设：1 处围护缺口")
+        check(kinds.get("area_mismatch") == 1, "默认预设：1 个面积偏差")
+        check(model.threshold_provenance.is_default(),
+              "默认核查的 provenance 标记为默认")
+        check(model.thresholds.gap_min_len == 0.10,
+              "默认围护缺口下限 100mm")
+
+        # ---- 2) 命令行式单项覆盖：聚类容差 100mm → 0.15m 缺口两端不再聚类 ----
+        model2 = audit_ifc_with_config(
+            ifc_path, overrides=parse_set_items(
+                ["endpoint_merge_tol_mm=100"]))
+        kinds2 = {}
+        for i in model2.issues:
+            kinds2[i.kind] = kinds2.get(i.kind, 0) + 1
+        check(kinds2.get("wall_end_gap", 0) == 0,
+              "聚类容差 100mm：不再判为墙段缺口")
+        check(kinds2.get("wall_free_end", 0) == 4,
+              f"聚类容差 100mm：缺口两端改报自由端（共 4 个，实际 "
+              f"{kinds2.get('wall_free_end', 0)}）")
+        check(model2.thresholds.endpoint_merge_tol == 0.10,
+              "endpoint_merge_tol 内部换算为 0.10m")
+        check(model2.threshold_provenance.profile == "custom",
+              "有覆盖时方案标记为 custom")
+        check(model2.threshold_provenance.overrides
+              == {"endpoint_merge_tol_mm": 100.0},
+              "provenance 记录覆盖项")
+
+        # ---- 3) 面积偏差警告线放到 5%：3.75% 偏差不再警告 ----
+        model3 = audit_ifc_with_config(
+            ifc_path, overrides={"area_dev_warn_pct": 5})
+        check(not any(i.kind == "area_mismatch" for i in model3.issues),
+              "面积偏差线 5%：样例房间不再警告")
+        check(model3.thresholds.area_dev_warn == 0.05,
+              "area_dev_warn 内部换算为 0.05")
+        mismatch = next(i for i in model.issues if i.kind == "area_mismatch")
+        check("警告线 2%" in mismatch.detail,
+              "问题详情中注明本次警告线（默认 2%）")
+
+        # ---- 4) 配置文件：围护缺口下限 200mm → 150mm 缺口不上报 ----
+        cfg_path = os.path.join(td, "th.json")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "_说明": "测试配置",
+                "profile": "default",
+                "gap_min_len_mm": 200,
+            }, f, ensure_ascii=False)
+        model4 = audit_ifc_with_config(ifc_path, config_path=cfg_path)
+        check(not any(i.kind == "room_enclosure_gap" for i in model4.issues),
+              "配置文件 gap_min_len=200mm：150mm 围护缺口不上报")
+        check(model4.threshold_provenance.config_path == cfg_path,
+              "provenance 记录配置文件路径")
+        gap_issue = next(i for i in model.issues
+                         if i.kind == "room_enclosure_gap")
+        check("上报下限 100mm" in gap_issue.detail,
+              "围护缺口详情注明上报下限")
+
+        # ---- 5) 配置文件指定 strict 预设 ----
+        cfg_strict = os.path.join(td, "strict.json")
+        with open(cfg_strict, "w", encoding="utf-8") as f:
+            json.dump({"profile": "strict"}, f)
+        t5, prov5 = resolve(config_path=cfg_strict)
+        check(t5.dup_iou == 0.80 and t5.area_dev_warn == 0.01,
+              "配置文件 profile=strict 生效（IoU 0.80 / 偏差 1%）")
+        check(prov5.profile == "strict", "来源标记为 strict")
+
+        # ---- 6) 预设 + 覆盖的优先级 ----
+        t6, prov6 = resolve("strict", overrides={"dup_iou": 0.95})
+        check(t6.dup_iou == 0.95 and t6.area_dev_warn == 0.01,
+              "--set 在预设基础上覆盖单项，其余保持 strict")
+        check(prov6.profile == "custom", "strict 上再覆盖标记为 custom")
+
+        # ---- 7) 库 API 内部名（米/比例）也接受 ----
+        t7, _ = resolve(overrides={"free_end_tol": 0.123})
+        check(abs(t7.free_end_tol - 0.123) < 1e-9,
+              "库 API 传内部名 free_end_tol（米）")
+
+        # ---- 8) 非法配置应报错而不是静默 ----
+        for bad in ({"gap_min_len_mm": -1}, {"unknown_key": 1}):
+            try:
+                resolve(overrides=bad)
+                check(False, f"非法阈值 {bad} 应抛 ThresholdConfigError")
+            except ThresholdConfigError:
+                check(True, f"非法阈值 {bad} 被拒绝")
+        try:
+            resolve(profile="nope")
+            check(False, "未知预设应报错")
+        except ThresholdConfigError:
+            check(True, "未知预设被拒绝")
+        try:
+            parse_set_items(["free_end_tol_mm"])
+            check(False, "格式错误的 --set 应报错")
+        except ThresholdConfigError:
+            check(True, "格式错误的 --set 被拒绝")
+
+        # ---- 9) 配置模板生成 / 回读闭环 ----
+        tpl_path = os.path.join(td, "template.json")
+        write_config_template(tpl_path, "loose")
+        t9, prov9 = resolve(config_path=tpl_path)
+        check(t9 == for_profile("loose"),
+              "loose 模板回读后与 loose 预设完全一致")
+        with open(tpl_path, encoding="utf-8") as f:
+            tpl = json.load(f)
+        check(set(META).issubset(set(tpl)), "模板包含全部阈值键")
+        check(all(k.startswith("_") or k == "profile" or k in META
+                  for k in tpl), "模板无非注释杂键")
+
+        # ---- 10) 报告：Excel 含“判定阈值”表与方案行；平面图可导出 ----
+        xlsx = report.export_excel(model4, os.path.join(td, "r.xlsx"))
+        from openpyxl import load_workbook
+        wb = load_workbook(xlsx)
+        check("判定阈值" in wb.sheetnames, "Excel 含“判定阈值”工作表")
+        ws = wb["判定阈值"]
+        first = ws.cell(row=1, column=2).value
+        check(cfg_path in (first or ""),
+              "阈值表首行注明配置文件来源")
+        body = {(r[0], r[1], r[2]) for r in ws.iter_rows(
+            min_row=3, values_only=True)}
+        check(("房间围护缺口", "围护缺口最小长度", "200 mm") in body,
+              "阈值表写入本次实际取值（200 mm）")
+        summary_vals = [c.value for c in wb["汇总"]["B"]]
+        check(any(cfg_path in str(v) for v in summary_vals if v),
+              "汇总表含阈值方案行")
+        png = report.export_annotated_plan(model4,
+                                           os.path.join(td, "p.png"))
+        check(os.path.getsize(png) > 100, "平面图导出成功")
+
+        # ---- 11) CLI 端到端：--set 与 init-config ----
+        out_dir = os.path.join(td, "out")
+        rc = cli_main(["audit", ifc_path, "-o", out_dir, "-q",
+                       "--set", "area_dev_warn_pct=5"])
+        check(rc == 0, "CLI audit --set 退出码 0")
+        with open(os.path.join(out_dir, "sample_结果.json"),
+                  encoding="utf-8") as f:
+            dump = json.load(f)
+        check(abs(dump["thresholds"]["values"]["area_dev_warn"] - 0.05)
+              < 1e-9,
+              "JSON 记录本次阈值（area_dev_warn=0.05）")
+        check(dump["thresholds"]["provenance"]["profile"] == "custom",
+              "JSON provenance=custom")
+
+        tpl2 = os.path.join(td, "cli_template.json")
+        rc2 = cli_main(["init-config", tpl2, "--profile", "strict"])
+        check(rc2 == 0 and os.path.exists(tpl2),
+              "CLI init-config 生成 strict 模板")
+
+        rc3 = cli_main(["audit", ifc_path, "-o", out_dir, "-q",
+                        "--set", "bad_key=1"])
+        check(rc3 == 2, "非法 --set 时退出码 2")
+
+        rc4 = cli_main(["audit", ifc_path, "-o", out_dir, "-q",
+                        "--config", os.path.join(td, "missing.json")])
+        check(rc4 == 2, "配置文件不存在时退出码 2")
+
+    print()
+    if failures:
+        print(f"{len(failures)} 项失败")
+        return 1
+    print("全部测试通过。")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run())

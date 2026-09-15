@@ -13,9 +13,13 @@ import json
 import os
 import sys
 
-from .pipeline import audit_ifc
+from .pipeline import audit_ifc, audit_ifc_with_config
 from . import report
 from .report import KIND_CN, SEV_CN
+from .thresholds import (
+    PROFILES, PROFILE_CN, parse_set_items, ThresholdConfigError,
+    write_config_template,
+)
 
 
 def _cmd_audit(args) -> int:
@@ -27,7 +31,15 @@ def _cmd_audit(args) -> int:
         if not args.quiet:
             print(f"[{pct:3d}%] {msg}", flush=True)
 
-    model = audit_ifc(args.ifc, progress=progress if not args.quiet else None)
+    try:
+        overrides = parse_set_items(args.set_threshold)
+        model = audit_ifc_with_config(
+            args.ifc, progress=progress if not args.quiet else None,
+            profile=args.profile, config_path=args.config,
+            overrides=overrides or None)
+    except ThresholdConfigError as exc:
+        print(f"阈值配置错误：{exc}", file=sys.stderr)
+        return 2
     s = model.summary()
 
     print("\n================ 核查汇总 ================")
@@ -36,6 +48,7 @@ def _cmd_audit(args) -> int:
     print(f"房间        : {s['rooms']}    净面积合计: {s['total_net_area']} m²")
     print(f"问题        : {s['issues']} 条 (错误 {s['errors']} / 警告 {s['warnings']})")
     print(f"重复构件组  : {s['duplicate_groups']}")
+    print(f"阈值方案    : {model.threshold_provenance.describe()}")
 
     if model.issues:
         print("\n---------------- 问题清单 ----------------")
@@ -85,8 +98,14 @@ def _cmd_audit(args) -> int:
     outputs["view3d"] = view3d
 
     # 机器可读 JSON（GUI / 后续流水线使用）
+    from dataclasses import asdict
     dump = {
         "summary": s,
+        "thresholds": {
+            "values": asdict(model.thresholds) if model.thresholds else None,
+            "provenance": (model.threshold_provenance.to_dict()
+                           if model.threshold_provenance else None),
+        },
         "issues": [
             {
                 "id": i.issue_id, "severity": i.severity, "kind": i.kind,
@@ -124,13 +143,41 @@ def main(argv=None) -> int:
     p_audit.add_argument("-q", "--quiet", action="store_true", help="精简输出")
     p_audit.add_argument("--fail-on-error", action="store_true",
                          help="存在错误级问题时以退出码 1 返回（便于 CI 集成）")
+    p_audit.add_argument(
+        "--profile", choices=PROFILES, default="default",
+        help="判定阈值预设：default=标准（默认）/ strict=严格 / loose=宽松；"
+             "会被配置文件与 --set 覆盖")
+    p_audit.add_argument("--config",
+                         help="阈值配置 JSON 文件（可用 init-config 生成模板）")
+    p_audit.add_argument(
+        "--set", dest="set_threshold", action="append", default=[],
+        metavar="KEY=VALUE",
+                         help="单项覆盖阈值，可重复，长度 mm / 偏差 %%。"
+                              "例如 --set gap_min_len_mm=50 --set area_dev_warn_pct=1")
     p_audit.set_defaults(func=_cmd_audit)
 
     p_gui = sub.add_parser("gui", help="启动图形界面")
     p_gui.set_defaults(func=lambda a: _launch_gui())
 
+    p_init = sub.add_parser(
+        "init-config", help="生成带说明的阈值配置文件模板（JSON）")
+    p_init.add_argument("path", help="配置文件输出路径，如 thresholds.json")
+    p_init.add_argument("--profile", choices=PROFILES, default="default",
+                        help="模板以哪套预设值为初始值（默认 default）")
+    p_init.set_defaults(func=_cmd_init_config)
+
     args = parser.parse_args(argv)
     return args.func(args)
+
+
+def _cmd_init_config(args) -> int:
+    if os.path.exists(args.path):
+        print(f"已存在同名文件，未覆盖：{args.path}", file=sys.stderr)
+        return 2
+    write_config_template(args.path, args.profile)
+    print(f"阈值配置模板已生成：{args.path}（初始预设：{PROFILE_CN[args.profile]}）")
+    print(f"修改后使用：python -m ifc_audit.cli audit model.ifc --config {args.path}")
+    return 0
 
 
 def _launch_gui() -> int:

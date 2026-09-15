@@ -46,7 +46,7 @@ def _autosize(ws):
 
 
 def export_excel(model: AuditModel, out_path: str) -> str:
-    """导出 4 张表：汇总 / 问题清单 / 房间净面积 / 重复构件。"""
+    """导出 5 张表：汇总 / 判定阈值 / 问题清单 / 房间净面积 / 重复构件。"""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
 
@@ -67,6 +67,7 @@ def export_excel(model: AuditModel, out_path: str) -> str:
     ws = wb.active
     ws.title = "汇总"
     s = model.summary()
+    prov = getattr(model, "threshold_provenance", None)
     rows = [
         ("指标", "数值"),
         ("IFC 文件", s["file"]),
@@ -79,10 +80,28 @@ def export_excel(model: AuditModel, out_path: str) -> str:
         ("其中-警告", s["warnings"]),
         ("重复构件组", s["duplicate_groups"]),
         ("净面积合计 (m²)", s["total_net_area"]),
+        ("判定阈值方案", prov.describe() if prov else "标准（内置默认）"),
     ]
     for r in rows:
         ws.append(r)
     style_header(ws, 2)
+    _autosize(ws)
+
+    # 2) 判定阈值（本次核查实际使用的一套，含来源）
+    ws = wb.create_sheet("判定阈值")
+    ws.append(["本次判定阈值方案", prov.describe() if prov else "标准（内置默认）"])
+    ws.append(["分组", "判定项", "本次取值", "配置键"])
+    header_row = 2
+    if getattr(model, "thresholds", None) is not None:
+        from .thresholds import rows_for_report
+        for row in rows_for_report(model.thresholds):
+            ws.append(list(row))
+    for c in range(1, 5):
+        cell = ws.cell(row=header_row, column=c)
+        cell.font = hdr_font
+        cell.fill = hdr_fill
+        cell.alignment = Alignment(horizontal="center")
+    ws.cell(row=1, column=1).font = Font(bold=True)
     _autosize(ws)
 
     # 2) 问题清单
@@ -290,18 +309,29 @@ def export_annotated_plan(model: AuditModel, out_path: str,
     ax.legend(handles=legend_items, loc="upper right", fontsize=9, framealpha=0.9)
 
     # 问题编号对照表放图下方
-    if model.issues:
-        def mt(s):
-            # SimHei 无上标 ²，交给 mathtext 渲染
-            return s.replace("m²", "m$^2$").replace("²", "$^2$")
+    def mt(s):
+        # SimHei 无上标 ²，交给 mathtext 渲染
+        return s.replace("m²", "m$^2$").replace("²", "$^2$")
 
+    n_lines = 0
+    if model.issues:
         lines = [
             mt(f"{n}. [{SEV_CN.get(i.severity, i.severity)}] "
                f"{KIND_CN.get(i.kind, i.kind)}: {i.title}")
             for n, i in enumerate(model.issues, start=1)
         ]
-        fig.subplots_adjust(bottom=0.28)
-        fig.text(0.02, 0.24, "\n".join(lines[:40]), fontsize=7, va="top",
+        n_lines = len(lines)
+        fig.subplots_adjust(bottom=0.32)
+        fig.text(0.02, 0.28, "\n".join(lines[:40]), fontsize=7, va="top",
+                 family="sans-serif")
+    else:
+        fig.subplots_adjust(bottom=0.12)
+
+    # 注明本次使用的阈值方案
+    prov = getattr(model, "threshold_provenance", None)
+    if prov is not None:
+        fig.text(0.02, 0.015, f"判定阈值：{mt(prov.describe())}",
+                 fontsize=7, va="bottom", color="#555555",
                  family="sans-serif")
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
