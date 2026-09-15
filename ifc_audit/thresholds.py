@@ -47,7 +47,9 @@ class Thresholds:
     dup_iou: float = 0.70             # 平面轮廓 IoU
     # 房间面积 / 归属
     area_dev_warn: float = 0.02       # 声明面积与几何面积偏差警告线
-    assign_tol: float = 0.055         # 门窗归入房间的距离容差（自动叠加 barrier_buffer）
+    # 注意：这里是外扩容差“之外”的归属余量，不含 barrier_buffer；
+    # 实际归属距离 = barrier_buffer + assign_tol，默认 5mm + 50mm = 55mm。
+    assign_tol: float = 0.05          # 门窗归入房间的归属余量（buffer 另算，勿重复叠加）
 
     @property
     def assign_distance(self) -> float:

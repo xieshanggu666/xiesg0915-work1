@@ -49,6 +49,25 @@ def run() -> int:
         check(model.thresholds.gap_min_len == 0.10,
               "默认围护缺口下限 100mm")
 
+        # ---- 1b) 回归：门窗归属距离 buffer 不得重复叠加，默认必须 55mm ----
+        td = model.thresholds
+        check(abs(td.assign_distance - 0.055) < 1e-9,
+              f"默认门窗归属距离 = 55mm（实际 {td.assign_distance*1000:g}mm）")
+        check(abs(td.assign_tol - 0.05) < 1e-9,
+              "归属余量 assign_tol = 50mm（barrier_buffer 另算）")
+        ts, _ = resolve("strict")
+        check(abs(ts.assign_distance - 0.052) < 1e-9,
+              f"strict 归属距离 = 52mm（实际 {ts.assign_distance*1000:g}mm）")
+        tl, _ = resolve("loose")
+        check(abs(tl.assign_distance - 0.060) < 1e-9,
+              f"loose 归属距离 = 60mm（实际 {tl.assign_distance*1000:g}mm）")
+        # 样例门窗归属数量不受影响
+        rooms0 = {r.name: r for r in model.rooms}
+        check(rooms0["A-101"].doors == 3 and rooms0["B-102"].doors == 2,
+              "样例门归属数量稳定（A=3, B=2）")
+        check(rooms0["A-101"].windows == 0 and rooms0["B-102"].windows == 1,
+              "样例窗归属数量稳定（B=1）")
+
         # ---- 2) 命令行式单项覆盖：聚类容差 100mm → 0.15m 缺口两端不再聚类 ----
         model2 = audit_ifc_with_config(
             ifc_path, overrides=parse_set_items(
